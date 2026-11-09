@@ -1,11 +1,11 @@
-buf.build/gen/go/gogo/protobuf/protocolbuffers/go v1.36.6-20240617172848-e1dbca2775a7.1 h1:DHj/fDjM+Ij3KR1IpFs6WdNcCtD4+Th3tEWyx3Xgs14=
-buf.build/gen/go/gogo/protobuf/protocolbuffers/go v1.36.6-20240617172848-e1dbca2775a7.1/go.mod h1:iCb72C37pWGhjKDeq9IbcMqVJAnXXHs5tEjiePfouhk=
+buf.build/gen/go/gogo/protobuf/protocolbuffers/go v1.36.12-20240617172848-e1dbca2775a7.2 h1:mAUvfP3fCC6BBd+xSmcs7ID5S21T/ZAwHrdjoltNjFI=
+buf.build/gen/go/gogo/protobuf/protocolbuffers/go v1.36.12-20240617172848-e1dbca2775a7.2/go.mod h1:HGAXK37R0AGeds6nQwUwIpxiwYqhMntM/9g2M8MGYpY=
 buf.build/gen/go/parca-dev/parca/grpc/go v1.6.2-20261023091517-a64d6177eb51.1 h1:TdwariBk6KLeZjrRrmfIVM4UmhZc49V+m5G59eEKA/M=
 buf.build/gen/go/parca-dev/parca/grpc/go v1.6.2-20261023091517-a64d6177eb51.1/go.mod h1:LzSHxDOu+YOnlDfu7Njhhubd5FQI/e4lq6QtR+r78QM=
 buf.build/gen/go/parca-dev/parca/protocolbuffers/go v1.36.12-20261023091517-a64d6177eb51.2 h1:R8UNUSNmKtwkyHBgJk2WFUKhhkdR5h83Y5+MiXPXEsw=
 buf.build/gen/go/parca-dev/parca/protocolbuffers/go v1.36.12-20261023091517-a64d6177eb51.2/go.mod h1:bxDxUQYtaVaZ8yDy8TTwCz/gb699CqKuuyhARyyR/OE=
-buf.build/gen/go/prometheus/prometheus/protocolbuffers/go v1.36.6-20250320161912-af2aab87b1b3.1 h1:EuFqAB/kfs/jh9aUGcvBjcxtU89wnXwsuQfcwGX1rhE=
-buf.build/gen/go/prometheus/prometheus/protocolbuffers/go v1.36.6-20250320161912-af2aab87b1b3.1/go.mod h1:ea/VK8bRnfyOuhQRzIk5hGigCqbZdzI8SHNLC3IyABU=
+buf.build/gen/go/prometheus/prometheus/protocolbuffers/go v1.36.12-20261001224011-d7f6cfecf2b8.2 h1:TUpkKJWGT+OzQOdI6aSMCywS4OA6Y+yM1wEZG91vJV0=
+buf.build/gen/go/prometheus/prometheus/protocolbuffers/go v1.36.12-20261001224011-d7f6cfecf2b8.2/go.mod h1:Qx24VtsEb9tnt/4PsbisP09A6Xpq9fCwM01WLAT5Hmg=
 cloud.google.com/go v0.26.0/go.mod h1:aQUYkXzVsufM+DwF1aE+0xfcU+56JwCaLick0ClmMTw=
 cyphar.com/go-pathrs v0.2.1 h1:9nx1vOgwVvX1mNBWDu93+vaceedpbsDqo+XuBGL40b8=
 cyphar.com/go-pathrs v0.2.1/go.mod h1:y8f1EMG7r+hCuFf/rXsKqMJrJAUoADZGNh5/vZPKcGc=
