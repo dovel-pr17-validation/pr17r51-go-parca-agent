@@ -1,0 +1,85 @@
+# Optional OTLP service naming and command-line policy from Kubernetes metadata.
+#
+# OTLP providers already emit standard host/process and discovered Kubernetes
+# resource attributes directly. No relabel config is needed for semconv keys.
+# When rules are configured, the `__meta_*` discovery labels are also available
+# to those rules and are deleted afterwards.
+#
+# Use it with --remote-store-format=otlp and --config-path. It requires full
+# discovery for Kubernetes metadata. Review the command-line rule below before
+# using it: command lines can contain credentials.
+#
+# Two notes before editing:
+#
+#   - Do not target `process.pid`. The exporter already emits it as a typed
+#     integer attribute; a relabel rule would overwrite it with a string.
+#     String attributes such as `service.name` can be overridden by rules.
+#
+#   - These names contain dots, which are valid Prometheus label names only
+#     under UTF-8 validation. They become column names on the arrow backends,
+#     so this file is written for OTLP export.
+
+relabel_configs:
+  # --- service.name ------------------------------------------------------
+  #
+  # By default an application can declare its service name, with comm and
+  # executable basename as fallbacks. These rules replace that policy with
+  # pod/controller/app-label naming, even for application-declared names.
+  #
+  # Rules run in order and a later replace overwrites an earlier one, so this
+  # is a fallback chain written weakest first. Each is gated on `(.+)` so it
+  # only fires when its source label is set, leaving the previous value in
+  # place when it is not.
+
+  # Weakest: the pod name. Always set, but carries the replicaset hash.
+  - source_labels: [__meta_kubernetes_pod_name]
+    regex: (.+)
+    target_label: service.name
+    action: replace
+
+  # Better: the controlling workload, so every pod of one Deployment shares a
+  # service.
+  - source_labels: [__meta_kubernetes_pod_controller_name]
+    regex: (.+)
+    target_label: service.name
+    action: replace
+
+  # Best: an explicit declaration by the workload author.
+  - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+    regex: (.+)
+    target_label: service.name
+    action: replace
+
+  # service.version, where the chart declares one.
+  - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_version]
+    regex: (.+)
+    target_label: service.version
+    action: replace
+
+  # Namespacing services by Kubernetes namespace keeps two `api` deployments
+  # in different namespaces apart.
+  - source_labels: [__meta_kubernetes_namespace]
+    regex: (.+)
+    target_label: service.namespace
+    action: replace
+
+  # --- Pod labels --------------------------------------------------------
+  #
+  # Arbitrary pod labels have no semconv equivalent, so they are promoted
+  # under their own names or not at all. Uncomment to carry them, and keep the
+  # labeldrop: the controller-generated ones change on every rollout and are
+  # pure cardinality.
+  #
+  # - action: labelmap
+  #   regex: __meta_kubernetes_pod_label_(.+)
+  #   replacement: ${1}
+  # - action: labeldrop
+  #   regex: apps_kubernetes_io_pod_index|controller_revision_hash|statefulset_kubernetes_io_pod_name|pod_template_hash
+
+  # --- Process -----------------------------------------------------------
+  #
+  # Command lines are not exported by default because they can contain secrets.
+  - source_labels: [__meta_process_cmdline]
+    regex: (.+)
+    target_label: process.command_line
+    action: replace

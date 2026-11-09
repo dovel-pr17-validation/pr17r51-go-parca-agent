@@ -1,0 +1,504 @@
+// Copyright 2022-2024 The Parca Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+
+package flags
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+	"strconv"
+	"time"
+
+	"github.com/alecthomas/kong"
+	kongyaml "github.com/alecthomas/kong-yaml"
+	"go.opentelemetry.io/ebpf-profiler/collector/config"
+	"go.opentelemetry.io/ebpf-profiler/tracer"
+	_ "google.golang.org/grpc/encoding/proto"
+
+	"github.com/parca-dev/parca-agent/internal/log"
+)
+
+var (
+	version string
+	commit  string
+	date    string
+	goArch  string
+)
+
+const (
+	// Use `sudo bpftool map` to determine the size of the maps.
+	defaultMemlockRLimit                   = 64 * 1024 * 1024  // ~64MB
+	defaultMemlockRLimitWithDWARFUnwinding = 512 * 1024 * 1024 // ~512MB
+
+	// We sample at 19Hz (19 times per second) because it is a prime number,
+	// and primes are good to avoid collisions with other things
+	// that may be happening periodically on a machine.
+	// In particular, 100 samples per second means every 10ms
+	// which is a frequency that may very well be used by user code,
+	// so a CPU profile could show a periodic workload on-CPU 100% of the time
+	// which is misleading.
+	defaultCPUSamplingFrequency = 19
+
+	profilerStatusError    = "error"
+	profilerStatusActive   = "active"
+	profilerStatusInactive = "inactive"
+
+	// This is the X in 2^(n + x) where n is the default hardcoded map size value
+	defaultMapScaleFactor = 0
+
+	// Power-of-two scale factor over the 1 MiB cupti_events ringbuf base.
+	// 0 = 1 MiB (current default), 8 = 256 MiB. Bump on GPU nodes running CUDA
+	// graph workloads that show cuda.errors.ringbuf_full.
+	defaultCUPTIEventScaleFactor = 0
+	maxCUPTIEventScaleFactor     = 8
+)
+
+func Parse() (Flags, error) {
+	flags := Flags{}
+	hostname, hostnameErr := os.Hostname() // hotnameErr handled below.
+
+	// Build Kong options
+	kongOptions := []kong.Option{
+		kong.Vars{
+			"hostname":                         hostname,
+			"default_cpu_sampling_frequency":   strconv.Itoa(defaultCPUSamplingFrequency),
+			"default_map_scale_factor":         strconv.Itoa(defaultMapScaleFactor),
+			"max_map_scale_factor":             strconv.Itoa(config.MaxArgMapScaleFactor),
+			"default_cupti_event_scale_factor": strconv.Itoa(defaultCUPTIEventScaleFactor),
+			"max_cupti_event_scale_factor":     strconv.Itoa(maxCUPTIEventScaleFactor),
+			"default_memlock_rlimit":           "0", // No limit by default. (flag is deprecated)
+		},
+	}
+
+	kong.Parse(&flags, kongOptions...)
+
+	// If a config path is provided, load the YAML configuration
+	if flags.ConfigPath != "" {
+		// Create a new parser with YAML configuration support
+		parser, err := kong.New(&flags,
+			kong.Vars{
+				"hostname":                         hostname,
+				"default_cpu_sampling_frequency":   strconv.Itoa(defaultCPUSamplingFrequency),
+				"default_map_scale_factor":         strconv.Itoa(defaultMapScaleFactor),
+				"max_map_scale_factor":             strconv.Itoa(config.MaxArgMapScaleFactor),
+				"default_cupti_event_scale_factor": strconv.Itoa(defaultCUPTIEventScaleFactor),
+				"max_cupti_event_scale_factor":     strconv.Itoa(maxCUPTIEventScaleFactor),
+				"default_memlock_rlimit":           "0",
+			},
+			kong.Configuration(kongyaml.Loader, flags.ConfigPath),
+		)
+		if err != nil {
+			return Flags{}, fmt.Errorf("failed to create parser with config: %w", err)
+		}
+
+		// Parse again with the configuration
+		_, err = parser.Parse(os.Args[1:])
+		if err != nil {
+			return Flags{}, fmt.Errorf("failed to parse flags with config: %w", err)
+		}
+	}
+
+	if flags.Node == "" && hostnameErr != nil {
+		return Flags{}, fmt.Errorf("failed to get hostname. Please set it with the --node flag: %w", hostnameErr)
+	}
+
+	flags.Log.ConfigureLogger()
+
+	return flags, nil
+}
+
+type Flags struct {
+	Log         FlagsLogs `embed:""                         prefix:"log-"`
+	HTTPAddress string    `default:"127.0.0.1:7071"         help:"Address to bind HTTP server to."`
+	Version     bool      `help:"Show application version."`
+
+	EnvironmentType string   `help:"The type of environment."`
+	MachineID       string   `help:"The machine ID."`
+	IncludeEnvVar   []string `help:"Environment variables to include in the profile."`
+
+	// The go tracer is disabled by default because Parca symbolizes native Go
+	// frames server-side from uploaded debuginfo, and doing it in both places
+	// wastes agent CPU. Turn it on when the backend has no symbolizer: the
+	// upstream interpreter reads gopclntab out of the binary and resolves
+	// function, file and line in-agent, so frames arrive named with no
+	// debuginfo upload at all.
+	SymbolizeGo bool `default:"false" help:"Symbolize Go frames in the agent using gopclntab, instead of relying on server-side symbolization. Enable when the backend has no symbolizer service; costs agent CPU and memory per Go process."`
+
+	OtelTags string `default:"" help:"Otel tags to attach to all traces."`
+	Tracers  string `default:"all" help:"Tracers to enable."`
+
+	PIDNamespaceTranslationMode tracer.PIDNamespaceTranslationMode `default:"none" enum:"none,auto,exact,recursive" help:"PID namespace translation: none disables translation; exact collects tasks in the agent's PID namespace; recursive also collects descendants and requires kernel BTF; auto uses recursive when supported, otherwise exact."`
+
+	Node          string `default:"${hostname}"               help:"The name of the node that the process is running on. If on Kubernetes, this must match the Kubernetes node name."`
+	ConfigPath    string `default:""                          help:"Path to config file."`
+	MemlockRlimit uint64 `default:"${default_memlock_rlimit}" help:"[deprecated] The value for the maximum number of bytes of memory that may be locked into RAM. It is used to ensure the agent can lock memory for eBPF maps. 0 means no limit."`
+
+	// pprof.
+	MutexProfileFraction int `default:"0" help:"Fraction of mutex profile samples to collect."`
+	BlockProfileRate     int `default:"0" help:"Sample rate for block profile."`
+
+	Profiling      FlagsProfiling      `embed:"" prefix:"profiling-"`
+	Metadata       FlagsMetadata       `embed:"" prefix:"metadata-"`
+	LocalStore     FlagsLocalStore     `embed:"" prefix:"local-store-"`
+	RemoteStore    FlagsRemoteStore    `embed:"" prefix:"remote-store-"`
+	Debuginfo      FlagsDebuginfo      `embed:"" prefix:"debuginfo-"`
+	Symbolizer     FlagsSymbolizer     `embed:"" prefix:"symbolizer-"`
+	OTLP           FlagsOTLP           `embed:"" prefix:"otlp-"`
+	ObjectFilePool FlagsObjectFilePool `embed:"" prefix:"object-file-pool-"`
+
+	ClockSyncInterval time.Duration `default:"3m" help:"How frequently to synchronize with the realtime clock."`
+
+	DWARFUnwinding         FlagsDWARFUnwinding `embed:""        prefix:"dwarf-unwinding-"`
+	PythonUnwindingDisable bool                `default:"false" help:"[deprecated] Disable Python unwinder."`
+	RubyUnwindingDisable   bool                `default:"false" help:"[deprecated] Disable Ruby unwinder."`
+	JavaUnwindingDisable   bool                `default:"true"  help:"[deprecated] Disable Java unwinder."`
+
+	InstrumentCudaLaunch bool `default:"true" help:"instrument calls to cudaLaunchKernel."`
+
+	AnalyticsOptOut bool `default:"false" help:"Opt out of sending anonymous usage statistics."`
+
+	Telemetry FlagsTelemetry `embed:"" prefix:"telemetry-"`
+	Hidden    FlagsHidden    `embed:"" hidden:""           prefix:""`
+
+	BPF FlagsBPF `embed:"" prefix:"bpf-"`
+
+	OfflineMode     FlagsOfflineMode `embed:"" prefix:"offline-mode-"`
+	OffCPUThreshold float64          `default:"0" help:"The probability (0.0-1.0) of off-CPU event being recorded."`
+
+	EnableOOMProf       bool `default:"false" help:"Enable OOMProf profiling integration."`
+	EnableOOMProfAllocs bool `default:"false" help:"Enable OOMProf alloc counts."`
+
+	MergeGpuProfiles bool `default:"false" help:"Report GPU kernel timing and GPU PC sampling under a single gpu_time/nanoseconds sample_type, differentiated by a gpu_view label (pc_sample|kernel_time). When false (the default), they are reported as separate sample_types (gpu_kernel_time/nanoseconds and gpu_pcsample/count) with no per-sample labels."`
+
+	GpuMetrics FlagsGpuMetrics `embed:"" prefix:"gpu-metrics-"`
+
+	GpuNvtx FlagsGpuNvtx `embed:"" prefix:"gpu-nvtx-"`
+
+	// OTLPLogging is a pointer so "unset" can follow the profile format; see
+	// SendLogs.
+	OTLPLogging *bool `negatable:"" help:"Also send parca-agent's own logs (and the profiler's) to the remote-store as OTLP log records, at --log-level. Defaults to on with --remote-store-format=otlp and off otherwise. Needs a remote-store; ignored in offline mode."`
+
+	ProbeConfigFile string `default:"" help:"Path to a YAML file declaring uprobe attachments. When set, parca-agent attaches a uprobe per matching binary and streams probe-fire events to the configured remote-store as OTLP/Arrow logs. Empty disables the feature."`
+}
+
+// Profile wire formats accepted by --remote-store-format.
+const (
+	RemoteStoreFormatArrowV1 = "arrow-v1"
+	RemoteStoreFormatArrowV2 = "arrow-v2"
+	RemoteStoreFormatOTLP    = "otlp"
+)
+
+// ProfileFormat resolves the effective format, honouring the deprecated
+// --use-v2-schema=false as a request for arrow-v1 so existing invocations keep
+// working. An explicit --remote-store-format always wins.
+func (f Flags) ProfileFormat() string {
+	if f.RemoteStore.Format == RemoteStoreFormatArrowV2 && !f.RemoteStore.UseV2Schema {
+		return RemoteStoreFormatArrowV1
+	}
+	return f.RemoteStore.Format
+}
+
+// FlagsGpuMetrics configures NVML-based GPU metrics (utilization, power,
+// temperature, clocks, PCIe throughput, and per-process GPU utilization),
+// exported over OTLP to the remote-store. Only parca-agent builds with the
+// gpumetrics build tag collect them; the static build ignores these flags.
+type FlagsGpuMetrics struct {
+	Disable        bool          `default:"false" help:"Don't collect GPU metrics. Set this on nodes where DCGM (dcgm-exporter) already reports GPU metrics, to avoid paying to store both."`
+	ExportInterval time.Duration `default:"10s"   help:"How frequently collected GPU metrics are batched and exported over OTLP."`
+}
+
+// FlagsGpuNvtx configures forwarding of NVTX annotations captured by parcagpu
+// to the remote-store: ranges as OTLP spans (one trace per top-level range),
+// marks as span events, or as log records when no range is open. It is on
+// whenever CUDA is instrumented and the node has NVIDIA GPUs.
+type FlagsGpuNvtx struct {
+	Disable        bool    `default:"false" help:"Don't forward NVTX annotations from instrumented CUDA processes."`
+	MaxSpansPerSec float64 `default:"500"   help:"Per-process budget of NVTX spans per second. Whole traces are kept or dropped when their top-level range opens. 0 means unlimited."`
+}
+
+type ExitCode int
+
+const (
+	ExitSuccess ExitCode = 0
+	ExitFailure ExitCode = 1
+
+	// Go 'flag' package calls os.Exit(2) on flag parse errors, if ExitOnError is set
+	ExitParseError ExitCode = 2
+)
+
+// SendLogs reports whether the agent's own logs should go to the remote store.
+// Unless set explicitly, that is when profiles go there as OTLP: a store that
+// speaks OTLP profiles takes OTLP logs too, while a Parca server would reject
+// them.
+func (f Flags) SendLogs() bool {
+	if f.OTLPLogging != nil {
+		return *f.OTLPLogging
+	}
+	return f.ProfileFormat() == RemoteStoreFormatOTLP
+}
+
+func ParseError(msg string, args ...interface{}) ExitCode {
+	log.Errorf(msg, args...)
+	return ExitParseError
+}
+
+func Failure(msg string, args ...interface{}) ExitCode {
+	log.Errorf(msg, args...)
+	return ExitFailure
+}
+
+func (f Flags) Validate() ExitCode {
+	if f.EnvironmentType == "" && f.MachineID != "" {
+		return ParseError("You can only specify the machine ID if you also provide the environment")
+	}
+
+	if f.BPF.CUPTIEventScaleFactor < 0 || f.BPF.CUPTIEventScaleFactor > maxCUPTIEventScaleFactor {
+		return ParseError("cupti_events scaling factor %d out of range (0-%d)",
+			f.BPF.CUPTIEventScaleFactor, maxCUPTIEventScaleFactor)
+	}
+
+	// The tracer settings, and the minimum kernel version, are the
+	// profiler's to judge.
+	if err := f.CollectorConfig().Validate(); err != nil {
+		return ParseError("Invalid configuration: %v", err)
+	}
+
+	if len(f.OfflineMode.StoragePath) > 0 && !f.OfflineMode.Upload && (len(f.RemoteStore.Address) > 0 || len(f.OTLP.Address) > 0) {
+		return ParseError("Specified both offline mode and a remote store; this configuration is invalid.")
+	}
+
+	if f.OfflineMode.Upload && len(f.OfflineMode.StoragePath) == 0 {
+		return ParseError("Specified --offline-mode-upload without --offline-mode-storage-path.")
+	}
+
+	if f.OffCPUThreshold < 0.0 || f.OffCPUThreshold > 1.0 {
+		return ParseError("Off-CPU threshold %f must be between 0.0 and 1.0",
+			f.OffCPUThreshold)
+	}
+
+	if code := f.validateRemoteStore(); code != ExitSuccess {
+		return code
+	}
+
+	return ExitSuccess
+}
+
+// validateRemoteStore checks the profile-format choices that are expressible
+// but cannot be served.
+func (f Flags) validateRemoteStore() ExitCode {
+	if f.RemoteStore.Format != RemoteStoreFormatOTLP {
+		return ExitSuccess
+	}
+
+	// The offline-mode format is Arrow IPC frames and the uploader speaks only
+	// the v1 streaming protocol, so there is nothing to write OTLP into.
+	if len(f.OfflineMode.StoragePath) > 0 {
+		return ParseError("--remote-store-format=otlp cannot be combined with offline mode.")
+	}
+
+	// Symbols travel the Parca DebuginfoService protocol wherever profiles go,
+	// so OTLP is not a standalone mode.
+	if f.Debuginfo.Address == "" && f.RemoteStore.Address == "" && !f.Debuginfo.UploadDisable {
+		return ParseError("--remote-store-format=otlp still uploads debuginfo over the Parca " +
+			"DebuginfoService protocol. Set --debuginfo-address or --remote-store-address, " +
+			"or pass --debuginfo-upload-disable to ship unsymbolized profiles.")
+	}
+
+	return ExitSuccess
+}
+
+// FlagsLocalStore provides local store configuration flags.
+type FlagsLogs struct {
+	Level  string `default:"info"   enum:"error,warn,info,debug" help:"Log level."`
+	Format string `default:"logfmt" enum:"logfmt,json"           help:"Configure if structured logging as JSON or as logfmt"`
+}
+
+func (f FlagsLogs) level() slog.Level {
+	switch f.Level {
+	case "error":
+		return slog.LevelError
+	case "warn":
+		return slog.LevelWarn
+	case "debug":
+		return slog.LevelDebug
+	default:
+		return slog.LevelInfo
+	}
+}
+
+// ConfigureLogger installs the stderr logger for the agent and the profiler.
+func (f FlagsLogs) ConfigureLogger() {
+	log.Setup(os.Stderr, f.Format, f.level())
+}
+
+// FlagsOTLP configures where the agent sends telemetry about *itself*: its own
+// spans, and (with --otlp-logging) its own logs. Profile data does not travel
+// this path -- that is --remote-store-address plus --remote-store-format.
+type FlagsOTLP struct {
+	Address  string `help:"The endpoint to send the agent's own OTLP traces to."`
+	Exporter string `default:"grpc" enum:"grpc,http,stdout" help:"The OTLP exporter to use."`
+}
+
+// FlagsProfiling provides profiling configuration flags.
+type FlagsProfiling struct {
+	Duration             time.Duration `default:"5s"                                help:"The agent profiling duration to use. Leave this empty to use the defaults."`
+	LabelTTL             time.Duration `default:"10m"                               help:"The interval at which the agent will refresh the labels of a tid."`
+	CPUSamplingFrequency int           `default:"${default_cpu_sampling_frequency}" help:"The frequency at which profiling data is collected, e.g., 19 samples per second."`
+
+	PerfEventBufferPollInterval       time.Duration `default:"250ms" help:"[deprecated] The interval at which the perf event buffer is polled for new events."`
+	PerfEventBufferProcessingInterval time.Duration `default:"100ms" help:"[deprecated] The interval at which the perf event buffer is processed."`
+	PerfEventBufferWorkerCount        int           `default:"4"     help:"[deprecated] The number of workers that process the perf event buffer."`
+
+	ProbabilisticInterval  time.Duration `default:"1m" help:"Time interval for which probabilistic profiling will be enabled or disabled."`
+	ProbabilisticThreshold uint          `default:"100" help:"If set to a value between 1 and 99 will enable probabilistic profiling: every probabilistic-interval a random number between 0 and 99 is chosen. If the given probabilistic-threshold is greater than this random number, the agent will collect profiles from this system for the duration of the interval."`
+
+	EnableErrorFrames bool `default:"false" help:"Enable collection of error frames."`
+}
+
+// FlagsMetadata provides metadadata configuration flags.
+type FlagsMetadata struct {
+	Discovery                  string            `default:"full" enum:"full,local" help:"Metadata discovery mode: full queries Kubernetes and container runtimes; local only reads host/process metadata and container IDs, leaving Kubernetes enrichment to the receiver."`
+	ExternalLabels             map[string]string `help:"String labels to attach to all profiles and as default resource attributes on all OTLP exports."`
+	ContainerRuntimeSocketPath string            `help:"The filesystem path to the container runtimes socket. Leave this empty to use the defaults."`
+
+	DisableCaching       bool `default:"false" help:"[deprecated] Disable caching of metadata."`
+	EnableProcessCmdline bool `default:"false" help:"[deprecated] Add /proc/[pid]/cmdline as a label, which may expose sensitive information like secrets in profiling data."`
+
+	DisableCPULabel        bool `default:"false" help:"Disable adding the cpu label to profiling data."`
+	DisableThreadIDLabel   bool `default:"false" help:"Disable adding the thread_id label to profiling data."`
+	DisableThreadCommLabel bool `default:"false" help:"Disable adding the thread_comm label to profiling data."`
+}
+
+// FlagsLocalStore provides local store configuration flags.
+type FlagsLocalStore struct {
+	Directory string `help:"The local directory to store the profiling data."`
+}
+
+// FlagsGRPC contains connection settings shared by the sample and debuginfo stores.
+type FlagsGRPC struct {
+	Address            string `help:"gRPC address to send requests to. ${address_help}"`
+	BearerToken        string `help:"Bearer token to authenticate with store." env:"${bearer_token_env}"`
+	BearerTokenFile    string `help:"File to read bearer token from to authenticate with store."`
+	Insecure           bool   `help:"Send gRPC requests via plaintext instead of TLS."`
+	InsecureSkipVerify bool   `help:"Skip TLS certificate verification."`
+
+	RPCUnaryTimeout time.Duration `default:"5m" help:"Maximum timeout window for unary gRPC requests including retries."`
+
+	GRPCMaxCallRecvMsgSize   int               `default:"33554432" help:"The maximum message size the client can receive."`
+	GRPCMaxCallSendMsgSize   int               `default:"33554432" help:"The maximum message size the client can send."`
+	GRPCStartupBackoffTime   time.Duration     `default:"1m" help:"The time between failed gRPC requests during startup phase."`
+	GRPCConnectionTimeout    time.Duration     `default:"3s" help:"The timeout duration for gRPC connection establishment."`
+	GRPCMaxConnectionRetries uint32            `default:"5" help:"The maximum number of retries to establish a gRPC connection."`
+	GRPCHeaders              map[string]string `help:"Additional gRPC headers to send with each request (key=value pairs)."`
+
+	ClientCert string `help:"Client certificate for mTLS"`
+	ClientKey  string `help:"Client key for mTLS"`
+}
+
+// FlagsRemoteStore provides remote store configuration flags.
+type FlagsRemoteStore struct {
+	FlagsGRPC `embed:"" set:"bearer_token_env=PARCA_BEARER_TOKEN" set:"address_help=Sends profiles and, by default, symbols."`
+
+	BatchWriteInterval time.Duration `default:"10s"   help:"[deprecated] Interval between batch remote client writes. Leave this empty to use the default value of 10s."`
+	RPCLoggingEnable   bool          `default:"false" help:"[deprecated] Enable gRPC logging."`
+
+	// Format selects the wire encoding profiles are sent in. It supersedes
+	// --use-v2-schema, which was a bool when there were only two encodings.
+	Format string `default:"arrow-v2" enum:"arrow-v1,arrow-v2,otlp" help:"Wire format for profile data: arrow-v1 (streaming, two round trips), arrow-v2 (unary WriteArrow), or otlp (OTLP/profiles). Symbols always upload over the Parca DebuginfoService protocol regardless."`
+
+	// Compression applies to the OTLP profiles export. The arrow paths carry
+	// their own compression inside the IPC payload (v2 uses LZ4), so adding a
+	// transport codec on top of them would compress twice.
+	//
+	// gzip only, because it is the one compressor grpc-go ships on both sides,
+	// so every OTLP receiver can decompress it. A codec the receiver has not
+	// installed fails at the first flush with "Decompressor is not installed
+	// for grpc-encoding <name>", and at the volumes the agent sends -- tens of
+	// KiB/s -- a better ratio is not worth a flag value that works against some
+	// receivers and not others.
+	Compression string `default:"gzip" enum:"none,gzip" help:"Transport compression for the OTLP profiles export. Ignored by the arrow formats, which compress inside the payload."`
+
+	UseV2Schema bool `name:"use-v2-schema" default:"true" help:"[deprecated] Superseded by --remote-store-format. Passing --use-v2-schema=false is equivalent to --remote-store-format=arrow-v1. This flag will be removed in a future release."`
+}
+
+// FlagsDebuginfo contains flags to configure debuginfo.
+type FlagsDebuginfo struct {
+	FlagsGRPC `embed:"" set:"bearer_token_env=PARCA_DEBUGINFO_BEARER_TOKEN" set:"address_help=Uploads symbols via the Parca DebuginfoService protocol. When unset, reuses the remote-store connection and ignores debuginfo connection settings."`
+
+	Directories           []string      `default:"/usr/lib/debug" help:"Ordered list of local directories to search for debuginfo files."`
+	TempDir               string        `default:"/tmp"           help:"The local directory path to store the interim debuginfo files."`
+	Strip                 bool          `default:"true"           help:"Only upload information needed for symbolization. If false the exact binary the agent sees will be uploaded unmodified."`
+	Compress              bool          `default:"false"          help:"Compress debuginfo files' DWARF sections before uploading."`
+	UploadDisable         bool          `default:"false"          help:"Disable debuginfo collection and upload."`
+	UploadMaxParallel     int           `default:"25"             help:"The maximum number of debuginfo upload requests to make in parallel."`
+	UploadTimeoutDuration time.Duration `default:"2m"             help:"The timeout duration to cancel upload requests."`
+	UploadCacheDuration   time.Duration `default:"5m"             help:"The duration to cache debuginfo upload responses for."`
+	DisableCaching        bool          `default:"false"          help:"Disable caching of debuginfo."`
+	UploadQueueSize       uint32        `default:"4096"           help:"The maximum number of debuginfo upload requests to queue. If the queue is full, new requests will be dropped."`
+}
+
+// FlagsSymbolizer contains flags to configure symbolization.
+type FlagsSymbolizer struct {
+	JITDisable bool `help:"[deprecated] Disable JIT symbolization."`
+}
+
+// FlagsDWARFUnwinding contains flags to configure DWARF unwinding.
+type FlagsDWARFUnwinding struct {
+	Disable bool `help:"[deprecated] Do not unwind using .eh_frame information."`
+	Mixed   bool `default:"true"                                    help:"[deprecated] Unwind using .eh_frame information and frame pointers."`
+}
+
+type FlagsTelemetry struct {
+	DisablePanicReporting bool  `default:"false"`
+	StderrBufferSizeKb    int64 `default:"4096"`
+}
+
+type FlagsObjectFilePool struct {
+	EvictionPolicy string `default:"lru" enum:"lru,lfu"                                                                                                                                                                                          help:"[deprecated] The eviction policy to use for the object file pool."`
+	Size           int    `default:"100" help:"[deprecated] The maximum number of object files to keep in the pool. This is used to avoid re-reading object files from disk. It keeps FDs open, so it should be kept in sync with ulimits. 0 means no limit."`
+}
+
+// FlagsHidden contains hidden flags used for debugging or running with untested configurations.
+type FlagsHidden struct {
+	AllowRunningAsNonRoot             bool `help:"Force running the Agent even if the user is not root. This will break a lot of the assumptions and result in the Agent malfunctioning."  hidden:""`
+	AllowRunningInNonRootPIDNamespace bool `help:"Force running the Agent in a non 'root' PID namespace. This will break a lot of the assumptions and result in the Agent malfunctioning." hidden:""`
+
+	ForcePanic bool `default:"false" help:"Panics the agent in a goroutine to test that telemetry works." hidden:""`
+
+	SupervisedChild bool `default:"false" help:"Set by the supervising parent process on the agent it spawns, so the child does not spawn another." hidden:""`
+
+	IgnoreUnsafeKernelVersion bool `default:"false" help:"Forces runs in kernels with known issues. This might freeze your system or cause other issues." hidden:""`
+
+	RateLimitUnwindInfo         uint32 `default:"50" hidden:""`
+	RateLimitProcessMappings    uint32 `default:"50" hidden:""`
+	RateLimitRefreshProcessInfo uint32 `default:"50" hidden:""`
+	RateLimitRead               uint32 `default:"50" hidden:""`
+}
+
+type FlagsBPF struct {
+	VerboseLogging        bool   `help:"Enable verbose BPF logging from eBPF code to ebpf trace_pipe."`
+	LogTracePipe          bool   `help:"Copy bpf trace_pipe to info logging."`
+	EventsBufferSize      uint32 `default:"8192"                     help:"Size in pages of the events buffer."`
+	MapScaleFactor        int    `default:"${default_map_scale_factor}" help:"Scaling factor for eBPF map sizes. Every increase by 1 doubles the map size. Increase if you see eBPF map size errors. Default is ${default_map_scale_factor} corresponding to 4GB of executable address space, max is ${max_map_scale_factor}."`
+	CUPTIEventScaleFactor int    `default:"${default_cupti_event_scale_factor}" help:"Power-of-two scale factor over the 1 MiB cupti_events ringbuf base for GPU profiling. Every increase by 1 doubles the buffer. Increase on GPU nodes running CUDA graph workloads that show cuda.errors.ringbuf_full. Default is ${default_cupti_event_scale_factor} (1 MiB), max is ${max_cupti_event_scale_factor}."`
+	VerifierLogLevel      uint32 `default:"0" help:"Log level of the eBPF verifier output (0,1,2). Default is 0."`
+	VerifierLogSize       int    `default:"0" help:"[deprecated] Unused."`
+}
+
+type FlagsOfflineMode struct {
+	StoragePath      string        `help:"[deprecated] Enables offline mode, with the data stored at the given path. Offline mode will be removed in a future release; buffer data in an OpenTelemetry Collector instead."`
+	RotationInterval time.Duration `default:"10m" help:"[deprecated] How often to rotate and compress the offline mode log."`
+	Upload           bool          `help:"[deprecated] Run the uploader for data written in offline mode."`
+}

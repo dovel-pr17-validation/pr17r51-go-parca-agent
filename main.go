@@ -1,0 +1,1015 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math/bits"
+	"net/http"
+	"net/http/pprof"
+	"os"
+	"os/exec"
+	"os/signal"
+	"runtime"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	debuginfogrpc "buf.build/gen/go/parca-dev/parca/grpc/go/parca/debuginfo/v1alpha1/debuginfov1alpha1grpc"
+	profilestoregrpc "buf.build/gen/go/parca-dev/parca/grpc/go/parca/profilestore/v1alpha1/profilestorev1alpha1grpc"
+	telemetrygrpc "buf.build/gen/go/parca-dev/parca/grpc/go/parca/telemetry/v1alpha1/telemetryv1alpha1grpc"
+	telemetrypb "buf.build/gen/go/parca-dev/parca/protocolbuffers/go/parca/telemetry/v1alpha1"
+	_ "github.com/KimMachineGun/automemlimit"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/armon/circbuf"
+	"github.com/common-nighthawk/go-figure"
+	"github.com/felixge/fgprof"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	promconfig "github.com/prometheus/common/config"
+	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/tklauser/numcpus"
+	"github.com/zcalusic/sysinfo"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/extension"
+	"go.opentelemetry.io/contrib/bridges/otelslog"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
+	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/metrics"
+	"go.opentelemetry.io/ebpf-profiler/probes/offcpu"
+
+	"github.com/parca-dev/parca-agent/internal/log"
+
+	"go.opentelemetry.io/otel"
+
+	otelreporter "go.opentelemetry.io/ebpf-profiler/reporter"
+	"go.opentelemetry.io/ebpf-profiler/times"
+	"go.opentelemetry.io/ebpf-profiler/tracer"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
+	"golang.org/x/sys/unix"
+	"google.golang.org/grpc"
+
+	"github.com/parca-dev/oomprof/oomprof"
+
+	"github.com/parca-dev/parca-agent/analytics"
+	"github.com/parca-dev/parca-agent/config"
+	"github.com/parca-dev/parca-agent/flags"
+	"github.com/parca-dev/parca-agent/gpumetrics"
+	"github.com/parca-dev/parca-agent/oom"
+	"github.com/parca-dev/parca-agent/parcagpu"
+	"github.com/parca-dev/parca-agent/probes"
+	"github.com/parca-dev/parca-agent/reporter"
+	"github.com/parca-dev/parca-agent/reporter/metadata"
+	"github.com/parca-dev/parca-agent/reporter/processlabels"
+	"github.com/parca-dev/parca-agent/uploader"
+)
+
+var (
+	version string
+	commit  string
+	date    string
+	goArch  string
+)
+
+type buildInfo struct {
+	GoArch, GoOs, VcsRevision, VcsTime string
+	VcsModified                        bool
+}
+
+func fetchBuildInfo() (*buildInfo, error) {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return nil, errors.New("can't read the build info")
+	}
+
+	buildInfo := buildInfo{}
+
+	for _, setting := range bi.Settings {
+		key := setting.Key
+		value := setting.Value
+
+		switch key {
+		case "GOARCH":
+			buildInfo.GoArch = value
+		case "GOOS":
+			buildInfo.GoOs = value
+		case "vcs.revision":
+			buildInfo.VcsRevision = value
+		case "vcs.time":
+			buildInfo.VcsTime = value
+		case "vcs.modified":
+			buildInfo.VcsModified = value == "true"
+		}
+	}
+
+	return &buildInfo, nil
+}
+
+func main() {
+	os.Exit(int(mainWithExitCode()))
+}
+
+func printVersion() {
+	fmt.Printf("parca-agent, version %s (commit: %s, date: %s), arch: %s\n", version, commit, date, goArch) //nolint:forbidigo
+}
+
+func mainWithExitCode() flags.ExitCode {
+	ctx := context.Background()
+
+	// Fetch build info such as the git revision we are based off
+	buildInfo, err := fetchBuildInfo()
+	if err != nil {
+		fmt.Println("failed to fetch build info: %w", err) //nolint:forbidigo
+		os.Exit(1)
+	}
+
+	if commit == "" {
+		commit = buildInfo.VcsRevision
+	}
+	if date == "" {
+		date = buildInfo.VcsTime
+	}
+	if goArch == "" {
+		goArch = buildInfo.GoArch
+	}
+
+	f, err := flags.Parse()
+	if err != nil {
+		log.Errorf("Failed to parse flags: %v", err)
+		return flags.ExitParseError
+	}
+
+	runtime.SetBlockProfileRate(f.BlockProfileRate)
+	runtime.SetMutexProfileFraction(f.MutexProfileFraction)
+
+	if f.Version {
+		printVersion()
+		return flags.ExitSuccess
+	}
+
+	if code := f.Validate(); code != flags.ExitSuccess {
+		return code
+	}
+
+	if f.OfflineMode.StoragePath != "" || f.OfflineMode.Upload {
+		log.Warn("Offline mode (--offline-mode-*) is deprecated and will be removed in a future release. " +
+			"To buffer profiles while the backend is unreachable, send them through an OpenTelemetry Collector " +
+			"with a persistent sending queue instead.")
+	}
+
+	if f.OfflineMode.Upload {
+		code, err := uploader.OfflineModeDoUpload(f)
+		if err != nil {
+			log.Errorf("failed to upload offline mode logs: %v", err)
+		}
+		return code
+	}
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(
+		collectors.NewBuildInfoCollector(),
+		collectors.NewGoCollector(
+			collectors.WithGoCollectorRuntimeMetrics(collectors.MetricsAll),
+		),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+
+	// Initialize metrics
+	meter := otel.Meter("go.opentelemetry.io/ebpf-profiler")
+	metrics.Start(meter)
+
+	// Surface OTel SDK errors (BSP export failures, drop counts, etc.) so
+	// a misconfigured trace/log endpoint doesn't fail silently -- the
+	// default handler is a no-op.
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		log.Warnf("otel: %v", err)
+	}))
+
+	// The vtproto codec is a process-global replacement of gRPC's "proto"
+	// codec, and every OTLP signal marshals through it. Install it before the
+	// first dial rather than relying on the remote-store dial to do it as a
+	// side effect, which only worked because that dial always came first.
+	flags.RegisterProtoCodec()
+
+	// Resolve compression here rather than at export time: setting gzip's
+	// level mutates the registered compressor's writer pool, which grpc-go
+	// documents as initialization-time only and not thread-safe.
+	compressOpt, _, err := flags.ConfigureCompression(f.RemoteStore.Compression)
+	if err != nil {
+		return flags.Failure("%v", err)
+	}
+
+	// Initialize tracing.
+	var (
+		exporter         flags.Exporter
+		reporterTraceExp flags.Exporter
+		tp               trace.TracerProvider = noop.NewTracerProvider()
+	)
+	if f.OTLP.Address != "" {
+		var err error
+
+		exporter, err = flags.NewExporter(f.OTLP.Exporter, f.OTLP.Address)
+		if err != nil {
+			log.Errorf("failed to create tracing exporter: %v", err)
+		}
+		// NewExporter always returns a non-nil exporter and non-nil error.
+		tp, err = flags.NewProvider(ctx, version, exporter, f.Metadata.ExternalLabels)
+		if err != nil {
+			log.Errorf("failed to create tracing provider: %v", err)
+		}
+
+		// Separate exporter for the reporter's TracerProvider so it can
+		// ship to the configured OTLP endpoint independent of the
+		// remote-store connection. Two exporters (one for the agent's own
+		// self-tracing, one for reporter-emitted spans like probes) keeps
+		// their BSP/Shutdown lifecycles independent.
+		reporterTraceExp, err = flags.NewExporter(f.OTLP.Exporter, f.OTLP.Address)
+		if err != nil {
+			log.Errorf("failed to create reporter trace exporter: %v", err)
+		}
+	}
+
+	isOfflineMode := len(f.OfflineMode.StoragePath) > 0
+	profileFormat := f.ProfileFormat()
+
+	// Dial the remote store only when there is one. This used to be gated on
+	// offline mode alone, which was right when "not offline" implied "has a
+	// remote store". OTLP profiles export is a third mode that needs neither,
+	// so an empty address must not be dialed -- gRPC rejects it with
+	// "received empty target in Build()".
+	var grpcConn *grpc.ClientConn
+	if !isOfflineMode && f.RemoteStore.Address != "" {
+		grpcConn, err = f.RemoteStore.WaitGrpcEndpoint(ctx, reg, tp)
+		if err != nil {
+			log.Errorf("failed to connect to server: %v", err)
+			return flags.ExitFailure
+		}
+		defer grpcConn.Close()
+	}
+
+	presentCores, err := numcpus.GetPresent()
+	if err != nil {
+		return flags.Failure("Failed to read CPU file: %v", err)
+	}
+
+	promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+		Name: "parca_agent_num_cpu",
+		Help: "Number of CPUs",
+	}).Set(float64(presentCores))
+
+	// The agent runs as a child of a small supervising parent when the parent
+	// has something to report about the child's death: a panic (stderr tail via
+	// ReportPanic) or an OOM kill (heap profile via oomprof). The two are
+	// independent, so disabling panic reporting keeps OOM profiling of the
+	// agent itself working.
+	reportPanics := !f.Telemetry.DisablePanicReporting
+	if !f.Hidden.SupervisedChild && (reportPanics || f.EnableOOMProf) && len(f.RemoteStore.Address) > 0 {
+		argsCopy := make([]string, 0, len(os.Args)+1)
+		argsCopy = append(argsCopy, os.Args...)
+		argsCopy = append(argsCopy, "--supervised-child")
+
+		buf, _ := circbuf.NewBuffer(f.Telemetry.StderrBufferSizeKb)
+
+		cmd := exec.Command(argsCopy[0], argsCopy[1:]...) //nolint:gosec
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = io.MultiWriter(os.Stderr, buf)
+
+		if f.EnableOOMProf {
+			// Try to ensure oom killer leaves the parent alive by lowering our own oom adjustment,
+			// if the parent gets oom killed too its possible no oom reports will be sent.
+			// TODO: weigh this strategy's effectiveness against a canary/ballast approach.
+			if err := os.WriteFile("/proc/self/oom_score_adj", []byte("-100"), 0o644); err != nil {
+				log.Errorf("Failed to set oom_score_adj: %v", err)
+			}
+		}
+
+		// Run garbage collector to minimize the amount of memory that the parent
+		// telemetry process uses.
+		runtime.GC()
+
+		// Setup OOMProf integration if enabled.
+		var oomProfState *oomprof.State
+		var oomSink *reporter.OOMProfOTLPSink
+		if f.EnableOOMProf {
+			var state *oomprof.State
+			var err error
+			if profileFormat == flags.RemoteStoreFormatOTLP {
+				var exportOpts []grpc.CallOption
+				if compressOpt != nil {
+					exportOpts = append(exportOpts, compressOpt)
+				}
+				oomSink, err = reporter.NewOOMProfOTLPSink(grpcConn, f.Node, f.Metadata.ExternalLabels,
+					f.EnableOOMProfAllocs, exportOpts...)
+				if err == nil {
+					state, err = oom.StartOOMProfWithReporter(ctx, oomSink, f.BPF.VerboseLogging, f.EnableOOMProfAllocs)
+				}
+			} else {
+				state, err = oom.StartOOMProf(ctx, grpcConn, f.BPF.VerboseLogging, f.Node, f.Metadata.ExternalLabels, f.EnableOOMProfAllocs)
+			}
+			if err != nil {
+				return flags.Failure("Failed to start OOMProf: %v", err)
+			}
+			oomProfState = state
+		}
+
+		// Start the subprocess instead of Run to get the PID
+		err := cmd.Start()
+		if err != nil {
+			log.Errorf("Failed to start subprocess: %v", err)
+			return flags.ExitFailure
+		}
+
+		// Get the subprocess PID for oomprof monitoring
+		subprocessPID := uint32(cmd.Process.Pid)
+		log.Debugf("Started parca-agent subprocess with PID %d", subprocessPID)
+
+		// If oomprof is enabled, tell it to watch our subprocess
+		if f.EnableOOMProf && oomProfState != nil {
+			err = oomProfState.WatchPid(subprocessPID)
+			if err != nil {
+				log.Errorf("Failed to watch subprocess PID %d: %v", subprocessPID, err)
+			} else {
+				log.Infof("OOMProf is now monitoring main parca-agent PID %d", subprocessPID)
+			}
+		}
+
+		// Wait for the subprocess to complete
+		err = cmd.Wait()
+		log.Infof("Subprocess completed %v exit: %d", err, cmd.ProcessState.ExitCode())
+		if oomSink != nil && killedBySIGKILL(cmd.ProcessState) {
+			if oomSink.WaitForProfile(subprocessPID, time.Second, 10*time.Second) {
+				log.Infof("Sent OOM profile for subprocess PID %d", subprocessPID)
+			} else {
+				log.Warnf("No OOM profile for SIGKILLed subprocess PID %d", subprocessPID)
+			}
+		}
+		if err != nil {
+			log.Error("======================= unexpected error =======================")
+			log.Error(buf.String())
+			log.Error("================================================================")
+
+			if reportPanics {
+				log.Error("about to report error to server")
+				var reportErr error
+				if profileFormat == flags.RemoteStoreFormatOTLP {
+					var si sysinfo.SysInfo
+					si.GetSysInfo()
+					reportErr = reporter.SendCrashReport(context.Background(), grpcConn, reporter.CrashReport{
+						Stderr:         buf.String(),
+						Status:         err.Error(),
+						ExitCode:       cmd.ProcessState.ExitCode(),
+						PID:            cmd.Process.Pid,
+						ServiceVersion: buildInfo.VcsRevision,
+						HostName:       f.Node,
+						HostArch:       runtime.GOARCH,
+						KernelRelease:  si.Kernel.Release,
+						ExternalLabels: f.Metadata.ExternalLabels,
+					})
+				} else {
+					telemetryClient := telemetrygrpc.NewTelemetryServiceClient(grpcConn)
+					_, reportErr = telemetryClient.ReportPanic(context.Background(), &telemetrypb.ReportPanicRequest{
+						Stderr:   buf.String(),
+						Metadata: getTelemetryMetadata(int(presentCores), cmd.ProcessState.ExitCode()),
+					})
+				}
+				if reportErr != nil {
+					log.Errorf("failed to report the error to the server: %v", reportErr)
+					return flags.ExitFailure
+				}
+				log.Info("report sent successfully")
+			}
+
+			if exiterr, ok := err.(*exec.ExitError); ok && exiterr.ExitCode() > 0 { //nolint: errorlint
+				return flags.ExitCode(exiterr.ExitCode())
+			}
+
+			return flags.ExitFailure
+		}
+
+		return flags.ExitSuccess
+	}
+
+	intro := figure.NewColorFigure("Parca Agent ", "roman", "yellow", true)
+	intro.Print()
+	printVersion()
+
+	// Context to drive main goroutine and the Tracer monitors.
+	mainCtx, mainCancel := signal.NotifyContext(ctx,
+		unix.SIGINT, unix.SIGTERM, unix.SIGABRT)
+	defer mainCancel()
+
+	if f.HTTPAddress != "" {
+		go func() {
+			mux := http.NewServeMux()
+			mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+			mux.Handle("/debug/fgprof", fgprof.Handler())
+			//nolint:gosec
+			if err = http.ListenAndServe(f.HTTPAddress, mux); err != nil {
+				log.Errorf("Serving pprof on %s failed: %s", f.HTTPAddress, err)
+			}
+		}()
+	}
+
+	externalLabels := reporter.Labels{}
+	if len(f.Metadata.ExternalLabels) > 0 {
+		for name, value := range f.Metadata.ExternalLabels {
+			externalLabels = append(externalLabels, reporter.Label{
+				Name:  name,
+				Value: value,
+			})
+		}
+	}
+	log.Infof("External labels: %s", externalLabels.String())
+
+	log.Debugf("Determining tracers to include")
+	interpreters, err := parseTracers(f.Tracers, f.SymbolizeGo)
+	if err != nil {
+		return flags.Failure("Failed to parse the included tracers: %s", err)
+	}
+
+	if !interpreters.Go.IsSymbolizationDisabled() {
+		log.Info("symbolizing Go frames in-agent from gopclntab (--symbolize-go)")
+	}
+
+	// Remove CUDA tracer if it isn't enabled.
+	if !f.InstrumentCudaLaunch {
+		interpreters.CUDA.Disabled = true
+	}
+
+	// Load relabel configs from the config file (if provided)
+	var relabelConfigs []*relabel.Config
+	if f.ConfigPath == "" {
+		log.Info("no config file provided, using default config")
+	} else {
+		cfgFile, err := config.LoadFile(f.ConfigPath)
+		if err != nil {
+			if !errors.Is(err, config.ErrEmptyConfig) {
+				return flags.Failure("failed to read config: %v", err)
+			}
+			log.Info("config file is empty, using default config")
+		}
+		if cfgFile != nil {
+			log.Infof("using config file: %s", f.ConfigPath)
+			// Only use relabel configs from the loaded config
+			// CLI flags are already handled by Kong's YAML configuration loader
+			relabelConfigs = cfgFile.RelabelConfigs
+		}
+	}
+
+	traceHandlerCacheSize := traceCacheSize(f.Profiling.Duration, f.Profiling.CPUSamplingFrequency, uint16(presentCores))
+
+	intervals := times.New(5*time.Second, f.Profiling.Duration, f.Profiling.ProbabilisticInterval)
+	times.StartRealtimeSync(mainCtx, f.ClockSyncInterval)
+
+	var client profilestoregrpc.ProfileStoreServiceClient
+	var debuginfoClient debuginfogrpc.DebuginfoServiceClient
+	if grpcConn != nil {
+		client = profilestoregrpc.NewProfileStoreServiceClient(grpcConn)
+		debuginfoClient = debuginfogrpc.NewDebuginfoServiceClient(grpcConn)
+	}
+
+	var offlineModeConfig *reporter.OfflineModeConfig
+	if isOfflineMode {
+		offlineModeConfig = &reporter.OfflineModeConfig{
+			StoragePath:      f.OfflineMode.StoragePath,
+			RotationInterval: f.OfflineMode.RotationInterval,
+		}
+	}
+
+	// Symbols always travel the Parca DebuginfoService protocol, whatever
+	// encoding profiles use. An explicit --debuginfo-address uses its own
+	// connection settings; otherwise symbols reuse the remote-store conn.
+	var debuginfoConn *grpc.ClientConn
+	if f.Debuginfo.Address != "" && !f.Debuginfo.UploadDisable && !isOfflineMode {
+		// The proxy need not be ready before CPU sampling starts. RPCs have
+		// deadlines and the bounded uploader queue retries failed artifacts.
+		debuginfoConn, err = f.Debuginfo.NewGrpcClient(reg, tp)
+		if err != nil {
+			return flags.Failure("Failed to configure debuginfo service: %v", err)
+		}
+		defer debuginfoConn.Close()
+		debuginfoClient = debuginfogrpc.NewDebuginfoServiceClient(debuginfoConn)
+	}
+
+	// NVTX ranges are exported as spans; marks outside any range ride the
+	// OTLP logs pipeline, which only exists when something needs it. Like GPU
+	// metrics, turn NVTX on for nodes that have NVIDIA GPUs and are
+	// instrumenting CUDA.
+	nvtxEnabled := f.InstrumentCudaLaunch && !f.GpuNvtx.Disable && grpcConn != nil &&
+		gpumetrics.CountNVIDIAGPUs("/proc") > 0
+
+	rcfg := reporter.Config{
+		ExternalLabels:         externalLabels,
+		ReportInterval:         f.Profiling.Duration,
+		LabelTTL:               f.Profiling.LabelTTL,
+		CacheSize:              traceHandlerCacheSize,
+		NodeName:               f.Node,
+		AgentRevision:          buildInfo.VcsRevision,
+		RelabelConfigs:         relabelConfigs,
+		Registerer:             reg,
+		SamplesPerSecond:       int64(f.Profiling.CPUSamplingFrequency),
+		LocalMetadataOnly:      f.Metadata.Discovery == "local",
+		DisableCPULabel:        f.Metadata.DisableCPULabel,
+		DisableThreadIDLabel:   f.Metadata.DisableThreadIDLabel,
+		DisableThreadCommLabel: f.Metadata.DisableThreadCommLabel,
+		MergeGpuProfiles:       f.MergeGpuProfiles,
+
+		DebuginfoClient:         debuginfoClient,
+		DisableSymbolUpload:     f.Debuginfo.UploadDisable || isOfflineMode,
+		StripTextSection:        f.Debuginfo.Strip,
+		SymbolUploadConcurrency: f.Debuginfo.UploadMaxParallel,
+		UploaderQueueSize:       f.Debuginfo.UploadQueueSize,
+		CacheDir:                f.Debuginfo.TempDir,
+
+		GRPCConn:       grpcConn,
+		TraceExporter:  reporterTraceExp,
+		ExportSelfLogs: f.SendLogs(),
+
+		EnableOOMProf:       f.EnableOOMProf,
+		EnableOOMProfAllocs: f.EnableOOMProfAllocs,
+
+		Mem:                memory.DefaultAllocator,
+		ProfileStoreClient: client,
+		UseV2Schema:        profileFormat == flags.RemoteStoreFormatArrowV2,
+		OfflineMode:        offlineModeConfig,
+	}
+
+	// Network operations to CA start here. All three formats ride the same
+	// remote-store connection, so the choice is only an encoding.
+	var parcaReporter reporter.ParcaReporter
+	if profileFormat == flags.RemoteStoreFormatOTLP {
+		if grpcConn == nil {
+			return flags.Failure("--remote-store-format=otlp requires --remote-store-address")
+		}
+
+		if compressOpt != nil {
+			rcfg.ExportCallOptions = []grpc.CallOption{compressOpt}
+		}
+		parcaReporter, err = reporter.NewOTLPProfiles(rcfg, grpcConn)
+		if err != nil {
+			return flags.Failure("Failed to start reporting: %v", err)
+		}
+		log.Infof("exporting profiles as OTLP/profiles to %s (compression: %s)",
+			f.RemoteStore.Address, f.RemoteStore.Compression)
+	} else {
+		parcaReporter, err = reporter.New(rcfg)
+		if err != nil {
+			return flags.Failure("Failed to start reporting: %v", err)
+		}
+	}
+
+	// The agent's logs, and the profiler's, also go to the remote store.
+	if f.SendLogs() && grpcConn != nil {
+		lp := parcaReporter.LoggerProvider()
+		log.Tee(log.ForOTLP(otelslog.NewHandler("parca-agent.agent", otelslog.WithLoggerProvider(lp))))
+		if fl, ok := lp.(interface{ ForceFlush(context.Context) error }); ok {
+			log.BeforeExit(func() { _ = fl.ForceFlush(context.Background()) })
+		}
+		log.Infof("sending parca-agent logs to %s via OTLP", f.RemoteStore.Address)
+	}
+
+	if f.ProbeConfigFile != "" {
+		if grpcConn == nil {
+			return flags.Failure("--probe-config requires a remote-store; cannot be used in offline mode")
+		}
+		probesSvc, err := probes.Start(mainCtx, probes.StartConfig{
+			ConfigPath: f.ProbeConfigFile,
+		}, parcaReporter)
+		if err != nil {
+			return flags.Failure("probes: failed to start: %v", err)
+		} else {
+			parcaReporter.SetProbes(probesSvc)
+			defer func() {
+				if err := probesSvc.Close(); err != nil {
+					log.Warnf("probes: close: %v", err)
+				}
+			}()
+		}
+	}
+
+	// Start AFTER SetProbes so the hook is wired before ReportExecutable can fire.
+	parcaReporter.Start(mainCtx)
+
+	includeEnvVars := libpf.Set[string]{}
+	if len(f.IncludeEnvVar) > 0 {
+		for _, env := range f.IncludeEnvVar {
+			includeEnvVars[env] = libpf.Void{}
+		}
+	}
+	// Always captured on the OTLP path, without the operator having to ask:
+	// these are the variables OTel defines for a process to name itself, and
+	// the exporter reads them for service.name. Without them the name falls
+	// back to comm, which is the thread name, so one process reports as several
+	// resources. Costs nothing beyond two more string compares per process --
+	// /proc/<pid>/environ is read once either way.
+	if profileFormat == flags.RemoteStoreFormatOTLP {
+		includeEnvVars["OTEL_SERVICE_NAME"] = libpf.Void{}
+		includeEnvVars["OTEL_RESOURCE_ATTRIBUTES"] = libpf.Void{}
+	}
+
+	var traceReporter otelreporter.TraceReporter = parcaReporter
+	traceBufferMultiplier := 1
+	if !interpreters.CUDA.IsDisabled() {
+		// GPU profiling generates high trace volume, increase buffer
+		traceBufferMultiplier = 50
+		traceReporter = parcagpu.Wrap(parcaReporter)
+	}
+
+	// Install the reporter before NewTracer: metrics.Enabled() is sampled once
+	// while the tracer starts, and would otherwise see no reporter.
+	metrics.SetReporter(parcaReporter)
+
+	// Load the eBPF code and map definitions
+	trc, err := tracer.NewTracer(mainCtx, &tracer.Config{
+		VerboseMode:            f.BPF.VerboseLogging,
+		ExecutableReporter:     parcaReporter,
+		TraceReporter:          traceReporter,
+		InterpretersConfig:     interpreters,
+		Intervals:              intervals,
+		SamplesPerSecond:       f.Profiling.CPUSamplingFrequency,
+		MapScaleFactor:         f.BPF.MapScaleFactor,
+		CUPTIEventScaleFactor:  f.BPF.CUPTIEventScaleFactor,
+		FilterErrorFrames:      !f.Profiling.EnableErrorFrames,
+		KernelVersionCheck:     !f.Hidden.IgnoreUnsafeKernelVersion,
+		BPFVerifierLogLevel:    f.BPF.VerifierLogLevel,
+		ProbabilisticInterval:  f.Profiling.ProbabilisticInterval,
+		ProbabilisticThreshold: f.Profiling.ProbabilisticThreshold,
+		// TODO[btv] -- make this a flag? it causes all cores to report 100% usage because they
+		// send traces even when pid == 0,
+		// maybe this is useful to someone, but I'm not sure why... we should check why upstream added it.
+		FilterIdleFrames:            true,
+		IncludeEnvVars:              includeEnvVars,
+		TraceBufferSizeMultiplier:   traceBufferMultiplier,
+		PIDNamespaceTranslationMode: f.PIDNamespaceTranslationMode,
+	})
+	if err != nil {
+		return flags.Failure("Failed to load eBPF tracer: %v", err)
+	}
+	log.Infof("eBPF tracer loaded")
+	defer trc.Close()
+
+	// Start watching for PID events.
+	trc.StartPIDEventProcessor(mainCtx)
+
+	// Attach our tracer to the perf event
+	if err := trc.AttachTracer(nil); err != nil {
+		return flags.Failure("Failed to attach to perf event: %v", err)
+	}
+	log.Info("Attached tracer program")
+
+	if f.Hidden.ForcePanic {
+		go func() { panic("--force-panic set") }()
+	}
+
+	if f.OffCPUThreshold > 0 {
+		if err := enableOffCPU(mainCtx, trc, f.OffCPUThreshold); err != nil {
+			return flags.Failure("Failed to start off-cpu profiling: %v", err)
+		}
+		log.Infof("Enabled off-cpu profiling")
+	}
+
+	if f.Profiling.ProbabilisticThreshold < tracer.ProbabilisticThresholdMax {
+		trc.StartProbabilisticProfiling(mainCtx)
+		log.Infof("Enabled probabilistic profiling")
+	} else {
+		if err := trc.EnableProfiling(); err != nil {
+			return flags.Failure("Failed to enable perf events: %v", err)
+		}
+	}
+
+	if err := trc.AttachSchedMonitor(); err != nil {
+		return flags.Failure("Failed to attach scheduler monitor: %v", err)
+	}
+
+	// This log line is used in our system tests to verify if that the agent has started. So if you
+	// change this log line update also the system test.
+	log.Infof("Attached sched monitor")
+
+	if !f.AnalyticsOptOut {
+		c := analytics.NewClient(
+			tp,
+			&http.Client{
+				Transport: otelhttp.NewTransport(
+					promconfig.NewUserAgentRoundTripper(
+						"parca.dev/analytics-client/"+version,
+						http.DefaultTransport),
+				),
+			},
+			"parca-agent",
+			time.Second*5,
+		)
+
+		var si sysinfo.SysInfo
+		si.GetSysInfo()
+		a := analytics.NewSender(
+			c,
+			runtime.GOARCH,
+			int(presentCores),
+			version,
+			si,
+			true,
+		)
+		go func() { a.Run(mainCtx) }()
+	}
+
+	// Spawn monitors for the various result maps
+	traceCh := make(chan *libpf.EbpfTrace)
+
+	if err := trc.StartMapMonitors(ctx, traceCh); err != nil {
+		return flags.Failure("Failed to start map monitors: %v", err)
+	}
+
+	// GPU metrics and NVTX spans name a process from what the profiler
+	// captured for it, as its profiles are; see gpumetrics.DeclaredLookup.
+	processDeclared := func(pid libpf.PID) (processlabels.Declared, bool) {
+		meta, resourceAttrs, ok := trc.ProcessMetaForPID(pid)
+		return processlabels.Declared{Context: resourceAttrs, Env: meta.InternalEnvVariables}, ok
+	}
+
+	if !interpreters.CUDA.IsDisabled() {
+		// A nil interface, not a nil *NvtxTracer, so parcagpu skips NVTX.
+		var nvtxRep otelreporter.NvtxReporter
+		if nvtxEnabled {
+			if resolver, err := parcaReporter.ProcessLabels().Fork(); err != nil {
+				log.Warnf("NVTX forwarding not started: %v", err)
+			} else {
+				nvtx := parcagpu.NewNvtxTracer(
+					parcagpu.NvtxTracerConfig{MaxSpansPerSec: f.GpuNvtx.MaxSpansPerSec},
+					gpumetrics.NewProcessResourcer(mainCtx, resolver, processDeclared, f.Node, metadata.InKubernetes(), f.Metadata.ExternalLabels),
+					parcagpu.NewOTLPTraceExport(grpcConn),
+					parcagpu.NewOTLPLogExport(grpcConn))
+				go nvtx.Run(mainCtx)
+				nvtxRep = nvtx
+			}
+		}
+		parcagpu.Start(ctx, trc, parcaReporter, parcaReporter, nvtxRep)
+	}
+
+	// NVML-based GPU metrics, exported over OTLP to the same remote store as
+	// profiles. Only builds with the gpumetrics tag collect them.
+	if grpcConn != nil && !f.GpuMetrics.Disable {
+		startGPUMetrics(mainCtx, f, grpcConn, parcaReporter.ProcessLabels(), processDeclared)
+	}
+
+	go func() {
+		for {
+			select {
+			case trace := <-traceCh:
+				if trace != nil {
+					trc.HandleTrace(trace)
+				}
+			case <-trc.Done():
+				log.Error("Shutting down: unrecoverable tracer error")
+				mainCancel()
+				return
+			case <-mainCtx.Done():
+				return
+			}
+		}
+	}()
+
+	if f.BPF.LogTracePipe {
+		go readTracePipe(mainCtx)
+	}
+
+	if exporter != nil {
+		if err := exporter.Start(context.Background()); err != nil {
+			return flags.Failure("Failed to start OTLP exporter: %v", err)
+		}
+	}
+	if reporterTraceExp != nil {
+		if err := reporterTraceExp.Start(context.Background()); err != nil {
+			return flags.Failure("Failed to start reporter trace exporter: %v", err)
+		}
+	}
+
+	// Block waiting for a signal to indicate the program should terminate
+	<-mainCtx.Done()
+
+	log.Info("Stop processing ...")
+	parcaReporter.Stop()
+	if grpcConn != nil {
+		if err := grpcConn.Close(); err != nil {
+			log.Fatalf("Stopping connection of OTLP client client failed: %v", err)
+		}
+	}
+
+	if exporter != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := exporter.Shutdown(ctx); err != nil {
+			log.Infof("Failed to stop exporter: %v", err)
+		}
+	}
+
+	select {
+	case <-trc.Done():
+		return flags.Failure("Exiting after tracer failure")
+	default:
+	}
+	log.Info("Exiting ...")
+	return flags.ExitSuccess
+}
+
+func getTelemetryMetadata(numCPU int, processExitCode int) map[string]string {
+	r := make(map[string]string)
+	var si sysinfo.SysInfo
+	si.GetSysInfo()
+
+	r["git_commit"] = commit
+	r["agent_version"] = version
+	r["go_arch"] = runtime.GOARCH
+	r["kernel_release"] = si.Kernel.Release
+	r["cpu_cores"] = strconv.Itoa(numCPU)
+	r["process_exit_code"] = strconv.Itoa(processExitCode)
+
+	return r
+}
+
+// NextPowerOfTwo returns input value if it's a power of two,
+// otherwise it returns the next power of two.
+func nextPowerOfTwo(v uint32) uint32 {
+	if v == 0 {
+		return 1
+	}
+	return 1 << bits.Len32(v-1)
+}
+
+// traceCacheSize defines the maximum number of elements for the caches in tracehandler.
+//
+// The caches in tracehandler have a size-"processing overhead" trade-off: Every cache miss will
+// trigger additional processing for that trace in userspace (Go). For most maps, we use
+// maxElementsPerInterval as a base sizing factor. For the tracehandler caches, we also multiply
+// with traceCacheIntervals. For typical/small values of maxElementsPerInterval, this can lead to
+// non-optimal map sizing (reduced cache_hit:cache_miss ratio and increased processing overhead).
+// Simply increasing traceCacheIntervals is problematic when maxElementsPerInterval is large
+// (e.g. too many CPU cores present) as we end up using too much memory. A minimum size is
+// therefore used here.
+func traceCacheSize(monitorInterval time.Duration, samplesPerSecond int,
+	presentCPUCores uint16,
+) uint32 {
+	const (
+		traceCacheIntervals = 6
+		traceCacheMinSize   = 65536
+	)
+
+	maxElements := maxElementsPerInterval(monitorInterval, samplesPerSecond, presentCPUCores)
+
+	size := maxElements * uint32(traceCacheIntervals)
+	if size < traceCacheMinSize {
+		size = traceCacheMinSize
+	}
+	return nextPowerOfTwo(size)
+}
+
+func maxElementsPerInterval(monitorInterval time.Duration, samplesPerSecond int,
+	presentCPUCores uint16,
+) uint32 {
+	return uint32(samplesPerSecond) * uint32(monitorInterval.Seconds()) * uint32(presentCPUCores)
+}
+
+func getTracePipe() (*os.File, error) {
+	for _, mnt := range []string{
+		"/sys/kernel/debug/tracing",
+		"/sys/kernel/tracing",
+		"/tracing",
+		"/trace",
+	} {
+		t, err := os.Open(mnt + "/trace_pipe")
+		if err == nil {
+			return t, nil
+		}
+		log.Debugf("Could not open trace_pipe at %s: %s", mnt, err)
+	}
+	return nil, os.ErrNotExist
+}
+
+func readTracePipe(ctx context.Context) {
+	tp, err := getTracePipe()
+	if err != nil {
+		log.Warn("Could not open trace_pipe, check that debugfs is mounted")
+		return
+	}
+
+	// When we're done kick ReadString out of blocked I/O.
+	go func() {
+		<-ctx.Done()
+		tp.Close()
+	}()
+
+	r := bufio.NewReader(tp)
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				continue
+			}
+			log.Errorf("Reading trace_pipe: %v", err)
+			return
+		}
+		line = strings.TrimSpace(line)
+		if len(line) > 0 {
+			log.Infof("bpf: %s", line)
+		}
+	}
+}
+
+// parseTracers parses the comma-separated tracers string and returns an
+// interpreterconfig.Config with only the listed interpreters enabled.
+// "all" enables every interpreter, with Go symbolization separately gated.
+// Unknown names return an error.
+func parseTracers(tracers string, symbolizeGo bool) (interpreterconfig.Config, error) {
+	// NoInterpreters disables parents, not their children. Enable Go's two
+	// independent functions only when requested below.
+	cfg := interpreterconfig.NoInterpreters()
+	cfg.Go.Labels.Disabled = true
+	cfg.Go.Symbolization.Disabled = true
+	for name := range strings.SplitSeq(tracers, ",") {
+		if strings.ToLower(strings.TrimSpace(name)) == "all" {
+			cfg = interpreterconfig.AllInterpreters()
+			tracers = "" // preserve "all" overriding the rest of the list
+			break
+		}
+	}
+
+	for name := range strings.SplitSeq(tracers, ",") {
+		name = strings.ToLower(strings.TrimSpace(name))
+		switch name {
+		case "python":
+			cfg.Python.Disabled = false
+		case "perl":
+			cfg.Perl.Disabled = false
+		case "php":
+			cfg.PHP.Disabled = false
+		case "hotspot":
+			cfg.Hotspot.Disabled = false
+		case "ruby":
+			cfg.Ruby.Disabled = false
+		case "v8":
+			cfg.V8.Disabled = false
+		case "dotnet":
+			cfg.Dotnet.Disabled = false
+		case "go":
+			cfg.Go.Symbolization.Disabled = false
+		case "labels":
+			// Upstream #1564 folded the standalone `labels` interpreter into Go,
+			// so "labels" now drives Go's goroutine labels. It also drives parca's
+			// native custom labels, which are independent of whether Go is enabled.
+			cfg.Go.Labels.Disabled = false
+			cfg.CustomLabels.Disabled = false
+		case "beam":
+			cfg.BEAM.Disabled = false
+		case "luajit":
+			cfg.LuaJIT.Disabled = false
+		case "cuda":
+			cfg.CUDA.Disabled = false
+		case "native":
+			log.Warn("Enabling the `native` tracer explicitly is deprecated (it's always-on)")
+		case "":
+			// ignore empty segments
+		default:
+			return interpreterconfig.Config{}, fmt.Errorf("unknown tracer: %s", name)
+		}
+	}
+
+	// Keep Go's runtime loader for goroutine labels, without registering the
+	// pclntab symbolizer. Frames then remain native for backend symbolization.
+	cfg.Go.Symbolization.Disabled = cfg.Go.Symbolization.Disabled || !symbolizeGo
+	cfg.Go.Disabled = cfg.Go.Labels.Disabled && cfg.Go.Symbolization.Disabled
+	return cfg, nil
+}
+
+// enableOffCPU enables the off-CPU probe. Upstream only exposes it as a
+// collector extension factory; its create function ignores the settings apart
+// from the component ID the factory validates.
+func enableOffCPU(ctx context.Context, trc *tracer.Tracer, threshold float64) error {
+	factory := offcpu.NewFactory()
+	ext, err := factory.Create(ctx, extension.Settings{ID: component.NewID(factory.Type())},
+		&offcpu.Config{Threshold: threshold})
+	if err != nil {
+		return err
+	}
+	p, ok := ext.(interface{ Probe() tracer.Probe })
+	if !ok {
+		return fmt.Errorf("offcpu extension %T does not expose a probe", ext)
+	}
+	return trc.Enable(ctx, p.Probe())
+}
+
+func killedBySIGKILL(state *os.ProcessState) bool {
+	ws, ok := state.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled() && ws.Signal() == syscall.SIGKILL
+}

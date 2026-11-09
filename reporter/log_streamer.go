@@ -1,0 +1,88 @@
+// Copyright 2026 The Parca Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package reporter
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
+	"go.opentelemetry.io/otel/sdk/resource"
+	"google.golang.org/grpc"
+
+	"github.com/parca-dev/parca-agent/reporter/processlabels"
+)
+
+// logProviderOptions is the resource-attribute payload attached to every batch
+// shipped by the OTLP log exporter.
+type logProviderOptions struct {
+	ServiceName    string // service.name = "parca-agent"
+	ServiceVersion string // service.version = build VCS revision
+	HostName       string // host.name = agent --node
+	ExternalLabels map[string]string
+}
+
+// Batching policy. The defaults the OTel SDK ships with are tuned for general
+// telemetry workloads (1 s flush interval); for probe-fire-style events we
+// want a tighter age cap so a single slow callback shows up in the UI within
+// a few hundred ms of the dtor firing.
+const (
+	logExportMaxBatchSize = 512
+	logExportInterval     = 250 * time.Millisecond
+	logMaxQueueSize       = 4096
+)
+
+// newGRPCLogExporter builds a log exporter that ships over an existing
+// connection. Used when agent logs piggyback the remote-store conn rather than
+// going to an explicitly configured OTLP endpoint.
+func newGRPCLogExporter(ctx context.Context, conn *grpc.ClientConn) (sdklog.Exporter, error) {
+	exp, err := otlploggrpc.New(ctx, otlploggrpc.WithGRPCConn(conn))
+	if err != nil {
+		return nil, fmt.Errorf("create otlploggrpc exporter: %w", err)
+	}
+	return exp, nil
+}
+
+// newLogProvider constructs an OTel logs LoggerProvider around exp. It takes an
+// exporter rather than a connection so the caller decides the destination:
+// agent logs can go to --otlp-address or piggyback the remote-store conn, and
+// this mirrors newTracerProvider, which has always taken an exporter.
+//
+// The SDK's BatchProcessor runs its own goroutines for batching and retry and
+// is torn down by the returned provider's Shutdown.
+func newLogProvider(exp sdklog.Exporter, opts logProviderOptions) *sdklog.LoggerProvider {
+	attrs := processlabels.ExternalAttributes(opts.ExternalLabels)
+	attrs = append(attrs, attribute.String("service.name", opts.ServiceName))
+	if opts.ServiceVersion != "" {
+		attrs = append(attrs, attribute.String("service.version", opts.ServiceVersion))
+	}
+	if opts.HostName != "" {
+		attrs = append(attrs, attribute.String("host.name", opts.HostName))
+	}
+	res := resource.NewSchemaless(attrs...)
+
+	bp := sdklog.NewBatchProcessor(exp,
+		sdklog.WithMaxQueueSize(logMaxQueueSize),
+		sdklog.WithExportMaxBatchSize(logExportMaxBatchSize),
+		sdklog.WithExportInterval(logExportInterval),
+	)
+
+	return sdklog.NewLoggerProvider(
+		sdklog.WithResource(res),
+		sdklog.WithProcessor(bp),
+	)
+}
