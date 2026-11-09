@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	buf.build/gen/go/parca-dev/parca/grpc/go v1.6.2-20261023091517-a64d6177eb51.1
 	buf.build/gen/go/parca-dev/parca/protocolbuffers/go v1.36.12-20261023091517-a64d6177eb51.2
-	buf.build/gen/go/prometheus/prometheus/protocolbuffers/go v1.36.6-20250320161912-af2aab87b1b3.1
+	buf.build/gen/go/prometheus/prometheus/protocolbuffers/go v1.36.12-20261001224011-d7f6cfecf2b8.2
 	github.com/KimMachineGun/automemlimit v0.7.3
 	github.com/NVIDIA/go-nvml v0.12.4-1
 	github.com/alecthomas/kong v1.12.1
@@ -69,7 +69,7 @@ require (
 )
 
 require (
-	buf.build/gen/go/gogo/protobuf/protocolbuffers/go v1.36.6-20240617172848-e1dbca2775a7.1 // indirect
+	buf.build/gen/go/gogo/protobuf/protocolbuffers/go v1.36.12-20240617172848-e1dbca2775a7.2 // indirect
 	cyphar.com/go-pathrs v0.2.1 // indirect
 	github.com/AdaLogics/go-fuzz-headers v0.0.0-20240806141605-e8a1dd7889d6 // indirect
 	github.com/AdamKorcz/go-118-fuzz-build v0.0.0-20230306123547-8075edf89bb0 // indirect
